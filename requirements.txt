@@ -1,0 +1,14 @@
+flask
+mongoengine
+pymongo
+python-dotenv
+werkzeug
+pyjwt
+flask-cors
+gunicorn
+requests
+bcrypt  
+celery[redis]
+redis
+pytz
+python-magic
