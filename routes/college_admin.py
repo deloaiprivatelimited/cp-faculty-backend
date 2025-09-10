@@ -42,6 +42,7 @@ def login():
     data = request.get_json() or {}
     email = (data.get("email") or "").strip().lower()
     password = data.get("password", "")
+    print(password)
 
     if not email or not password:
         return response(False, "email and password are required"), 400

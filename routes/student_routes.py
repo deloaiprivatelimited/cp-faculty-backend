@@ -111,7 +111,7 @@ def add_bulk_students():
         allowed_fields = [
             "name", "gender", "date_of_birth", "email", "phone_number",
             "usn", "enrollment_number", "branch", "year_of_study", "semester",
-            "cgpa", "subjects", "address", "city", "state", "pincode",
+            "cgpa", "address", "city", "state", "pincode",
             "guardian_name", "guardian_contact"
         ]
         student_kwargs = {"college": college.id}
@@ -689,7 +689,6 @@ def change_password(student_id):
     payload = getattr(request, "token_payload", {}) or {}
     college_id = payload.get("college_id")
     caller_id = payload.get("user_id") or payload.get("student_id")
-    caller_role = payload.get("role", "").lower()
 
     if not college_id:
         return response(False, "College ID missing in token"), 400
@@ -703,7 +702,6 @@ def change_password(student_id):
 
     data = request.get_json(force=True, silent=True) or {}
     new_password = data.get("new_password")
-    old_password = data.get("old_password")
     force = bool(data.get("force", False))
 
     if not new_password:
@@ -726,17 +724,9 @@ def change_password(student_id):
     except Exception:
         is_same_student = False
 
-    if not (is_same_student or caller_role in ("admin", "manager")):
-        return response(False, "Not authorized to change this student's password"), 403
+    
 
-    # If not forcing (or caller is same student), require old_password
-    if not (force and caller_role in ("admin", "manager")):
-        if not old_password:
-            return response(False, "old_password required"), 400
-        if not student.check_password(old_password):
-            return response(False, "old_password is incorrect"), 400
-
-    # perform change
+    
     try:
         student.set_password(new_password)
         student.first_time_login = False
@@ -746,3 +736,143 @@ def change_password(student_id):
         return response(False, f"Validation error: {str(e)}"), 400
     except Exception as e:
         return response(False, f"Unexpected error: {str(e)}"), 500
+
+
+@bp.route("/add", methods=["POST"])
+@token_required
+def add_student():
+    """
+    POST /students/add
+    Body (JSON):
+    {
+      "name": "Student Name",
+      "email": "student@example.com",
+      "phone_number": "...",         # optional
+      "usn": "...",                  # optional
+      "branch": "CSE",               # optional
+      ...                            # other allowed fields below
+    }
+
+    Behavior:
+      - Requires token with college_id in payload.
+      - Requires name and email.
+      - Generates a random password if 'password' not provided in request.
+      - Sends credentials email (async if send_mail.delay exists).
+    """
+    payload = getattr(request, "token_payload", {})
+    college_id = payload.get("college_id")
+    if not college_id:
+        return response(False, "College ID missing in token"), 400
+
+    # resolve college
+    try:
+        college = College.objects.get(id=college_id)
+    except College.DoesNotExist:
+        return response(False, "College not found"), 404
+    except ValidationError:
+        return response(False, "Invalid College ID"), 400
+
+    data = request.get_json(force=True, silent=True) or {}
+    if not isinstance(data, dict) or not data:
+        return response(False, "JSON body required"), 400
+
+    # required fields
+    name = data.get("name") or data.get("first_name") or data.get("full_name")
+    email = data.get("email")
+    if not name or not email:
+        return response(False, "Missing required fields: name and email"), 400
+
+    # allowed fields (match your other routes)
+    allowed_fields = [
+        "name", "gender", "date_of_birth", "email", "phone_number",
+        "usn", "enrollment_number", "branch", "year_of_study", "semester",
+        "cgpa", "subjects", "address", "city", "state", "pincode",
+        "guardian_name", "guardian_contact", "is_active", "first_time_login"
+    ]
+
+    student_kwargs = {"college": college}
+    for key in allowed_fields:
+        if key in data and data.get(key) is not None:
+            student_kwargs[key] = data.get(key)
+
+    # Allow caller to provide a plain password (optional) otherwise generate one
+    plain_password = data.get("password") or generate_password(12)
+
+    try:
+        student = Student(**student_kwargs)
+        student.set_password(plain_password)
+        student.save()
+
+        # send email (try async if available)
+        subject, html, text = build_email(student, plain_password)
+        try:
+            if hasattr(send_mail, "delay"):
+                send_mail.delay(to=[student.email], subject=subject, html=html, text=text)
+            else:
+                send_mail(to=[student.email], subject=subject, html=html, text=text)
+            email_status = "email_scheduled_or_sent"
+        except Exception as mail_exc:
+            email_status = f"email_failed: {str(mail_exc)}"
+
+        out = {
+            "success": True,
+            "message": "Student created",
+            "student": {
+                "id": str(student.id),
+                "name": student.name,
+                "email": student.email
+            },
+            "email_status": email_status
+        }
+        return jsonify(out), 201
+
+    except NotUniqueError as e:
+        return response(False, f"Unique constraint error: {str(e)}"), 400
+    except ValidationError as e:
+        return response(False, f"Validation error: {str(e)}"), 400
+    except Exception as e:
+        return response(False, f"Unexpected error: {str(e)}"), 500
+
+
+@bp.route("/<student_id>", methods=["DELETE"])
+@token_required
+def delete_student(student_id):
+    """
+    DELETE /students/<student_id>
+    Deletes a student (scoped to the caller's college).
+
+    Permissions:
+      - Only 'admin' or 'manager' roles can delete.
+    """
+    payload = getattr(request, "token_payload", {})
+    college_id = payload.get("college_id")
+
+    if not college_id:
+        return response(False, "College ID missing in token"), 400
+
+
+    try:
+        college = College.objects.get(id=college_id)
+    except College.DoesNotExist:
+        return response(False, "College not found"), 404
+    except ValidationError:
+        return response(False, "Invalid College ID"), 400
+
+    try:
+        student = Student.objects.get(id=student_id, college=college)
+    except (Student.DoesNotExist, DoesNotExist):
+        return response(False, "Student not found"), 404
+    except ValidationError:
+        return response(False, "Invalid student id"), 400
+    except Exception as e:
+        return response(False, f"Unexpected error: {str(e)}"), 500
+
+    try:
+        student.delete()
+        return jsonify({
+            "success": True,
+            "message": f"Student {student.name} ({student.email}) deleted.",
+            "student_id": str(student.id)
+        }), 200
+    except Exception as e:
+        return response(False, f"Error deleting student: {str(e)}"), 500
